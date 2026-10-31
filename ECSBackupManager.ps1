@@ -1050,7 +1050,8 @@ $script:backupTimer.Add_Tick({
     }
 })
 $btnRunBackup.Add_Click({
-    if (-not $cmbSite.SelectedItem) {
+    $selectedSite = [string]$cmbSite.SelectedItem
+    if ([string]::IsNullOrWhiteSpace($selectedSite)) {
         [System.Windows.Forms.MessageBox]::Show("Select a Site (Location) before running backup.")
         return
     }
@@ -1070,7 +1071,7 @@ $btnRunBackup.Add_Click({
             $Config = Load-Config $ConfigFile
         }
         $Config = Validate-Config ([ref]$Config)
-        $Config.General.SiteName       = $cmbSite.SelectedItem
+        $Config.General.SiteName       = $selectedSite
         $Config.General.BackupPath     = $txtBackupPath.Text
         $Config.General.SASToken       = $txtSAS.Text
         $Config.General.StorageAccount = $txtStorage.Text
@@ -1087,7 +1088,7 @@ $btnRunBackup.Add_Click({
         $Config.Email.EmailFrom  = $txtEmailFrom.Text
         $workerArgs = @{
             Config = $Config
-            SelectedSite = [string]$cmbSite.SelectedItem
+            SelectedSite = $selectedSite
             EnableAzure = [bool]$chkAzureUpload.Checked
         }
         $functionNames = @(
@@ -1100,7 +1101,6 @@ $btnRunBackup.Add_Click({
             "function $functionName {`n$functionBody`n}"
         }
         $workerScript = @"
-param(`$Config, `$SelectedSite, `$EnableAzure)
 function Update-Progress {
     param([int]`$Value)
     if (`$Value -lt 0) { `$Value = 0 }
@@ -1112,9 +1112,13 @@ function Update-Status {
     `$BackupProgressState.Status = `$Message
 }
 $($functionDefinitions -join "`n")
-`$result = Start-Backup -Config `$Config `
-    -StatusCallback { param(`$message) Update-Status `$message } `
-    -SelectedSite `$SelectedSite -EnableAzure `$EnableAzure
+`$backupParameters = @{
+    Config = `$BackupConfig
+    StatusCallback = { param(`$message) Update-Status `$message }
+    SelectedSite = `$BackupSelectedSite
+    EnableAzure = `$BackupEnableAzure
+}
+`$result = Start-Backup @backupParameters
 return `$result
 "@
         $script:backupProgressState = [hashtable]::Synchronized(@{
@@ -1129,12 +1133,12 @@ return `$result
         foreach ($variableName in @("AppRoot", "ProfilesDir", "SitesDir", "LogDir", "LogFile")) {
             $runspace.SessionStateProxy.SetVariable($variableName, (Get-Variable $variableName -ValueOnly))
         }
+        $runspace.SessionStateProxy.SetVariable("BackupConfig", $workerArgs.Config)
+        $runspace.SessionStateProxy.SetVariable("BackupSelectedSite", $workerArgs.SelectedSite)
+        $runspace.SessionStateProxy.SetVariable("BackupEnableAzure", $workerArgs.EnableAzure)
         $runspace.SessionStateProxy.SetVariable("BackupProgressState", $script:backupProgressState)
         $script:backupPowerShell.Runspace = $runspace
         [void]$script:backupPowerShell.AddScript($workerScript)
-        [void]$script:backupPowerShell.AddArgument($workerArgs.Config)
-        [void]$script:backupPowerShell.AddArgument($workerArgs.SelectedSite)
-        [void]$script:backupPowerShell.AddArgument($workerArgs.EnableAzure)
         $btnRunBackup.Enabled = $false
         $btnRunBackup.Text = "Backup Running..."
         Update-Status "Running backup..."
