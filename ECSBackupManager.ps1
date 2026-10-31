@@ -328,7 +328,11 @@ function Start-Backup {
         [string]$SelectedSite,
         [bool]$EnableAzure
     )
-    if (-not $SelectedSite) {
+    if ([string]::IsNullOrWhiteSpace($SelectedSite) -and $Config.General) {
+        $SelectedSite = [string]$Config.General.SiteName
+    }
+    Write-Log "Backup worker resolved site selection: '$SelectedSite'."
+    if ([string]::IsNullOrWhiteSpace($SelectedSite)) {
         throw "No site selected — cannot run backup."
     }
     $siteConfigPath = Join-Path $SitesDir "$SelectedSite.ini"
@@ -1049,7 +1053,8 @@ $script:backupTimer.Add_Tick({
     }
 })
 $btnRunBackup.Add_Click({
-    if (-not $cmbSite.SelectedItem) {
+    $selectedSite = $cmbSite.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($selectedSite)) {
         [System.Windows.Forms.MessageBox]::Show("Select a Site (Location) before running backup.")
         return
     }
@@ -1064,12 +1069,12 @@ $btnRunBackup.Add_Click({
     Update-Status "Starting backup..."
     Update-Progress 0
     try {
-        Write-Log "Backup triggered from GUI."
+        Write-Log "Backup triggered from GUI for site '$selectedSite'."
         if (Test-Path $ConfigFile) {
             $Config = Load-Config $ConfigFile
         }
         $Config = Validate-Config ([ref]$Config)
-        $Config.General.SiteName       = $cmbSite.SelectedItem
+        $Config.General.SiteName       = $selectedSite
         $Config.General.BackupPath     = $txtBackupPath.Text
         $Config.General.SASToken       = $txtSAS.Text
         $Config.General.StorageAccount = $txtStorage.Text
@@ -1086,7 +1091,6 @@ $btnRunBackup.Add_Click({
         $Config.Email.EmailFrom  = $txtEmailFrom.Text
         $workerArgs = @{
             Config = $Config
-            SelectedSite = [string]$cmbSite.SelectedItem
             EnableAzure = [bool]$chkAzureUpload.Checked
         }
         $functionNames = @(
@@ -1099,7 +1103,7 @@ $btnRunBackup.Add_Click({
             "function $functionName {`n$functionBody`n}"
         }
         $workerScript = @"
-param(`$Config, `$SelectedSite, `$EnableAzure)
+param(`$Config, `$EnableAzure)
 function Update-Progress {
     param([int]`$Value)
     if (`$Value -lt 0) { `$Value = 0 }
@@ -1113,7 +1117,7 @@ function Update-Status {
 $($functionDefinitions -join "`n")
 `$result = Start-Backup -Config `$Config `
     -StatusCallback { param(`$message) Update-Status `$message } `
-    -SelectedSite `$SelectedSite -EnableAzure `$EnableAzure
+    -SelectedSite `$Config.General.SiteName -EnableAzure `$EnableAzure
 return `$result
 "@
         $script:backupProgressState = [hashtable]::Synchronized(@{
@@ -1132,7 +1136,6 @@ return `$result
         $script:backupPowerShell.Runspace = $runspace
         [void]$script:backupPowerShell.AddScript($workerScript)
         [void]$script:backupPowerShell.AddArgument($workerArgs.Config)
-        [void]$script:backupPowerShell.AddArgument($workerArgs.SelectedSite)
         [void]$script:backupPowerShell.AddArgument($workerArgs.EnableAzure)
         $btnRunBackup.Enabled = $false
         $btnRunBackup.Text = "Backup Running..."
