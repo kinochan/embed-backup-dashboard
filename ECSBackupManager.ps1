@@ -5,6 +5,7 @@ Add-Type -AssemblyName System.Core
 # ============================================
 # AppRoot detection
 # ============================================
+$script:AppVersion = "2.0"
 $AppRoot = $null
 if ($PSScriptRoot -and $PSScriptRoot.Trim() -ne "") {
     $AppRoot = $PSScriptRoot
