@@ -1133,6 +1133,9 @@ return `$result
         foreach ($variableName in @("AppRoot", "ProfilesDir", "SitesDir", "LogDir", "LogFile")) {
             $runspace.SessionStateProxy.SetVariable($variableName, (Get-Variable $variableName -ValueOnly))
         }
+        $runspace.SessionStateProxy.SetVariable("BackupConfig", $workerArgs.Config)
+        $runspace.SessionStateProxy.SetVariable("BackupSelectedSite", $workerArgs.SelectedSite)
+        $runspace.SessionStateProxy.SetVariable("BackupEnableAzure", $workerArgs.EnableAzure)
         $runspace.SessionStateProxy.SetVariable("BackupProgressState", $script:backupProgressState)
         $script:backupPowerShell.Runspace = $runspace
         [void]$script:backupPowerShell.AddScript($workerScript)
