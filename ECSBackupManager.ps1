@@ -227,19 +227,21 @@ function Backup-Database {
         [string]$BackupPath,
         [string]$DbName,
         [string]$Timestamp,
-        [string]$SqlCmdPath
+        [string]$SqlCmdPath,
+        [int]$ProgressStart,
+        [int]$ProgressRange
     )
     $bakFile = Join-Path $BackupPath "$dbName-$timestamp.bak"
     Write-Log "Backing up $dbName to $bakFile"
     $query  = "BACKUP DATABASE [$dbName] TO DISK='$bakFile' WITH INIT, STATS = 10"
-    $output = & $SqlCmdPath -S $ServerName -E -C -Q $query 2>&1
-    foreach ($line in $output) {
+    & $SqlCmdPath -S $ServerName -E -C -Q $query 2>&1 | ForEach-Object {
+        $line = [string]$_
         if ($line -match "([0-9]+) percent processed") {
             $percent = [int]$matches[1]
-            Update-Progress $percent
+            Update-Progress ($ProgressStart + [int]($percent * $ProgressRange / 100))
             Update-Status "Backing up $dbName ($percent%)"
         }
-    }
+    } | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "sqlcmd returned exit code $LASTEXITCODE for $dbName"
     }
@@ -254,24 +256,23 @@ function Upload-ToAzure {
         [string]$Container,
         [string]$SasToken,
         [string]$DbName,
-        [string]$Timestamp
+        [string]$Timestamp,
+        [int]$ProgressStart,
+        [int]$ProgressRange
     )
     $blobName        = "$dbName-$timestamp.bak"
     $encodedBlobName = [System.Uri]::EscapeDataString($blobName)
     $dest            = "https://$StorageAccount.blob.core.windows.net/$Container/$encodedBlobName$SasToken"
     Write-Log "Uploading $bakFile to Azure container '$container'"
     Write-Log "Destination: $dest"
-    $output = & $AzCopyPath copy $BakFile $dest --overwrite=true --from-to=LocalBlob 2>&1
-    foreach ($line in $output) {
-        if ($line -match "100.0 \%") {
-            Update-Progress 95
-            Update-Status "Azure upload complete for $dbName"
+    & $AzCopyPath copy $BakFile $dest --overwrite=true --from-to=LocalBlob 2>&1 | ForEach-Object {
+        $line = [string]$_
+        if ($line -match "([0-9]+(?:\.[0-9]+)?)\s*%") {
+            $percent = [double]$matches[1]
+            Update-Progress ($ProgressStart + [int]($percent * $ProgressRange / 100))
+            Update-Status "Uploading $dbName to Azure ($percent%)"
         }
-        elseif ($line -match "50.0 \%") {
-            Update-Progress 85
-            Update-Status "Azure upload in progress for $dbName (50%)"
-        }
-    }
+    } | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "AzCopy returned exit code $LASTEXITCODE for $dbName"
     }
@@ -373,17 +374,17 @@ function Start-Backup {
     Start-Sleep -Seconds 1
     $StatusCallback.Invoke("Starting backup...")
     Update-Progress 5
-    foreach ($dbName in $databases) {
+    for ($databaseIndex = 0; $databaseIndex -lt $databases.Count; $databaseIndex++) {
+        $dbName = $databases[$databaseIndex]
+        $phaseStart = 5 + ($databaseIndex * 45)
+        $backupRange = if ($EnableAzure) { 30 } else { 45 }
         try {
-            if ($dbName -eq "ECS7") {
-                $StatusCallback.Invoke("Backing up ECS7...")
-                Update-Progress 10
-            } else {
-                $StatusCallback.Invoke("Backing up ECS7_Cloud...")
-                Update-Progress 10
-            }
+            $StatusCallback.Invoke("Backing up $dbName...")
+            Update-Progress $phaseStart
             $bakFile = Backup-Database -ServerName $serverName -BackupPath $backupPath `
-                                       -DbName $dbName -Timestamp $timestamp -SqlCmdPath $sqlcmd
+                                       -DbName $dbName -Timestamp $timestamp -SqlCmdPath $sqlcmd `
+                                       -ProgressStart $phaseStart -ProgressRange $backupRange
+            Update-Progress ($phaseStart + $backupRange)
             if ($EnableAzure) {
                 if (-not (Validate-SasToken $sas)) {
                     $msg = "Invalid SAS token; skipping Azure upload for $dbName."
@@ -392,30 +393,28 @@ function Start-Backup {
                     $StatusCallback.Invoke($msg)
                     continue
                 }
-                if ($dbName -eq "ECS7") {
-                    $StatusCallback.Invoke("Uploading ECS7 to Azure...")
-                    Update-Progress 80
-                } else {
-                    $StatusCallback.Invoke("Uploading ECS7_Cloud to Azure...")
-                    Update-Progress 80
-                }
+                $StatusCallback.Invoke("Uploading $dbName to Azure...")
                 Upload-ToAzure -AzCopyPath $azcopy -BakFile $bakFile -StorageAccount $storageAccount `
-                               -Container $siteName -SasToken $sas -DbName $dbName -Timestamp $timestamp
+                               -Container $siteName -SasToken $sas -DbName $dbName -Timestamp $timestamp `
+                               -ProgressStart ($phaseStart + $backupRange) -ProgressRange (45 - $backupRange)
+                Update-Progress ($phaseStart + 45)
             }
             else {
                 Write-Log "Azure upload disabled — skipping upload for $dbName."
                 $StatusCallback.Invoke("Azure upload disabled — skipping $dbName.")
             }
+            Update-Progress ($phaseStart + 45)
         }
         catch {
             $msg = "Error backing up ${dbName}: ${_}"
             $errors.Add($msg) | Out-Null
             Write-Log "ERROR: $msg"
+            Update-Progress ($phaseStart + 45)
         }
     }
     try {
         $StatusCallback.Invoke("Cleaning retention...")
-        Update-Progress 90
+        Update-Progress 96
         Clean-Retention -BackupPath $backupPath -RetentionDays $localRetentionDays
     }
     catch {
@@ -438,7 +437,7 @@ function Start-Backup {
     }
     else {
         $StatusCallback.Invoke("Sending email report...")
-        Update-Progress 95
+        Update-Progress 98
         Send-EmailReport -SiteName $siteName -Timestamp $timestamp -Errors $errors `
                          -SmtpServer $emailCfg.SMTPServer `
                          -SmtpPort   ([int]$emailCfg.SMTPPort) `
@@ -450,6 +449,7 @@ function Start-Backup {
     Update-Progress 100
     $StatusCallback.Invoke("Backup completed.")
     Write-Log "Backup completed for site '$siteName' at $(Get-Date)"
+    return ($errors.Count -eq 0)
 }
 # ============================================
 # WinForms GUI
@@ -979,11 +979,75 @@ $form.Add_Resize({
     }
 })
 $form.Add_FormClosing({
+    param($sender, $eventArgs)
+    if ($script:backupPowerShell) {
+        $eventArgs.Cancel = $true
+        [System.Windows.Forms.MessageBox]::Show(
+            "Wait for the backup to finish before closing ECS Backup Manager.",
+            "Backup in Progress"
+        )
+        return
+    }
     $tray.Visible = $false
 })
 # ============================================
 # Backup button wiring
 # ============================================
+$script:backupPowerShell = $null
+$script:backupAsyncResult = $null
+$script:backupProgressState = $null
+$script:backupTimer = New-Object System.Windows.Forms.Timer
+$script:backupTimer.Interval = 200
+$script:backupTimer.Add_Tick({
+    if ($script:backupProgressState.Status -ne $script:lastBackupStatus) {
+        $script:lastBackupStatus = $script:backupProgressState.Status
+        Update-Status $script:lastBackupStatus
+    }
+    if ($script:backupProgressState.Progress -ne $script:lastBackupProgress) {
+        $script:lastBackupProgress = $script:backupProgressState.Progress
+        Update-Progress $script:lastBackupProgress
+    }
+    if (-not $script:backupAsyncResult.IsCompleted) { return }
+
+    $script:backupTimer.Stop()
+    $success = $false
+    try {
+        $workerOutput = $script:backupPowerShell.EndInvoke($script:backupAsyncResult)
+        if ($workerOutput.Count -gt 0) {
+            $success = [bool]$workerOutput[$workerOutput.Count - 1]
+        }
+        if ($script:backupPowerShell.Streams.Error.Count -gt 0) {
+            throw ($script:backupPowerShell.Streams.Error -join [Environment]::NewLine)
+        }
+    }
+    catch {
+        Update-Status "Backup failed."
+        Write-Log "Backup failed: $_"
+        Refresh-Logs
+        $tray.ShowBalloonTip(1500,"Backup Failed","Errors occurred during backup.",[System.Windows.Forms.ToolTipIcon]::Error)
+        $success = $null
+    }
+    finally {
+        $runspace = $script:backupPowerShell.Runspace
+        $script:backupPowerShell.Dispose()
+        $runspace.Dispose()
+        $script:backupPowerShell = $null
+        $script:backupAsyncResult = $null
+        $script:backupProgressState = $null
+        $btnRunBackup.Enabled = $true
+        $btnRunBackup.Text = "Run Backup Now"
+    }
+    if ($null -eq $success) { return }
+
+    Refresh-Logs
+    if ($success) {
+        Update-Status "Backup completed successfully."
+        $tray.ShowBalloonTip(1500,"Backup Complete","All backup tasks finished.",[System.Windows.Forms.ToolTipIcon]::Info)
+    } else {
+        Update-Status "Backup completed with errors."
+        $tray.ShowBalloonTip(1500,"Backup Completed with Errors","Review the log for details.",[System.Windows.Forms.ToolTipIcon]::Warning)
+    }
+})
 $btnRunBackup.Add_Click({
     if (-not $cmbSite.SelectedItem) {
         [System.Windows.Forms.MessageBox]::Show("Select a Site (Location) before running backup.")
@@ -999,8 +1063,8 @@ $btnRunBackup.Add_Click({
     }
     Update-Status "Starting backup..."
     Update-Progress 0
-    Write-Log "Backup triggered from GUI."
     try {
+        Write-Log "Backup triggered from GUI."
         if (Test-Path $ConfigFile) {
             $Config = Load-Config $ConfigFile
         }
@@ -1020,17 +1084,74 @@ $btnRunBackup.Add_Click({
         $Config.Email.SMTPPass   = $txtSMTPPass.Text
         $Config.Email.EmailTo    = $txtEmailTo.Text
         $Config.Email.EmailFrom  = $txtEmailFrom.Text
+        $workerArgs = @{
+            Config = $Config
+            SelectedSite = [string]$cmbSite.SelectedItem
+            EnableAzure = [bool]$chkAzureUpload.Checked
+        }
+        $functionNames = @(
+            "Write-Log", "Load-Config", "Validate-Config", "Validate-SasToken",
+            "Get-SqlCmdPath", "Get-AzCopyPath", "Backup-Database",
+            "Upload-ToAzure", "Clean-Retention", "Send-EmailReport", "Start-Backup"
+        )
+        $functionDefinitions = foreach ($functionName in $functionNames) {
+            $functionBody = (Get-Command $functionName -CommandType Function).ScriptBlock.ToString()
+            "function $functionName {`n$functionBody`n}"
+        }
+        $workerScript = @"
+param(`$Config, `$SelectedSite, `$EnableAzure)
+function Update-Progress {
+    param([int]`$Value)
+    if (`$Value -lt 0) { `$Value = 0 }
+    if (`$Value -gt 100) { `$Value = 100 }
+    `$BackupProgressState.Progress = `$Value
+}
+function Update-Status {
+    param([string]`$Message)
+    `$BackupProgressState.Status = `$Message
+}
+$($functionDefinitions -join "`n")
+`$result = Start-Backup -Config `$Config `
+    -StatusCallback { param(`$message) Update-Status `$message } `
+    -SelectedSite `$SelectedSite -EnableAzure `$EnableAzure
+return `$result
+"@
+        $script:backupProgressState = [hashtable]::Synchronized(@{
+            Status = "Starting backup..."
+            Progress = 0
+        })
+        $script:lastBackupStatus = $null
+        $script:lastBackupProgress = -1
+        $script:backupPowerShell = [powershell]::Create()
+        $runspace = [runspacefactory]::CreateRunspace()
+        $runspace.Open()
+        foreach ($variableName in @("AppRoot", "ProfilesDir", "SitesDir", "LogDir", "LogFile")) {
+            $runspace.SessionStateProxy.SetVariable($variableName, (Get-Variable $variableName -ValueOnly))
+        }
+        $runspace.SessionStateProxy.SetVariable("BackupProgressState", $script:backupProgressState)
+        $script:backupPowerShell.Runspace = $runspace
+        [void]$script:backupPowerShell.AddScript($workerScript)
+        [void]$script:backupPowerShell.AddArgument($workerArgs.Config)
+        [void]$script:backupPowerShell.AddArgument($workerArgs.SelectedSite)
+        [void]$script:backupPowerShell.AddArgument($workerArgs.EnableAzure)
+        $btnRunBackup.Enabled = $false
+        $btnRunBackup.Text = "Backup Running..."
         Update-Status "Running backup..."
-        Start-Backup -Config $Config -StatusCallback { param($m) Update-Status $m } `
-                     -SelectedSite $cmbSite.SelectedItem `
-                     -EnableAzure $chkAzureUpload.Checked
-        Update-Status "Refreshing logs..."
-        Refresh-Logs
-        Update-Status "Backup completed successfully."
-        Update-Progress 100
-        $tray.ShowBalloonTip(1500,"Backup Complete","All backup tasks finished.",[System.Windows.Forms.ToolTipIcon]::Info)
+        $script:backupAsyncResult = $script:backupPowerShell.BeginInvoke()
+        $script:backupTimer.Start()
     }
     catch {
+        if ($script:backupPowerShell) {
+            $runspace = $script:backupPowerShell.Runspace
+            $script:backupPowerShell.Dispose()
+            if ($runspace) { $runspace.Dispose() }
+            $script:backupPowerShell = $null
+            $script:backupAsyncResult = $null
+            $script:backupProgressState = $null
+            $script:backupTimer.Stop()
+        }
+        $btnRunBackup.Enabled = $true
+        $btnRunBackup.Text = "Run Backup Now"
         Update-Status "Backup failed."
         Write-Log "Backup failed: $_"
         Refresh-Logs
